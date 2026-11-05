@@ -1,0 +1,323 @@
+/*
+  Práctica 7 - Sensores ópticos y de ultrasonido
+  Medidor de volumen de arroz o fríjol. Envase real de Majo: cono truncado de 27.7 cm de alto,
+  Ø interno 8 cm en la base y 10.7 cm en la boca (≈ 1915 cm³ lleno).
+  ESP32 DevKit V1 + Sharp GP2Y0A21YK0F (10–80 cm, acondicionado con TL072) + HC-SR04
+  + LCD 16x2 con módulo I2C (PCF8574).
+
+  Alimentación (montaje de Majo):
+    TL072:            +12 V / -12 V de la fuente dual.
+    Sharp, HC-SR04 y LCD: 5 V tomados del pin VIN del ESP32 (con el ESP32 por USB llegan ~4.8 V)
+                      o de un 7805 desde +12 V. Escriban en V_5V lo que midan con el multímetro.
+    Divisor de offset: Ra 33k a esos 5 V, Rb 15k a GND (no se cambia nada por usar ±12 V).
+    OJO: con ±12 V el TL072 puede sacar ~10 V; R3 1k + BAT85 a 3V3/GND antes de GPIO34 son obligatorios.
+
+  Conexiones (ver esquematicos/esquematico_general_esp32.png):
+    Canal óptico:  salida del TL072 (después de R3 1k, D1/D2 BAT85, C5 100n) -> GPIO34 (ADC1_CH6)
+    HC-SR04:       VCC->5 V, GND->GND, Trig->GPIO25,
+                   Echo->R4 2.2k->GPIO35, y GPIO35->R5 3.3k->GND  (5 V -> 3.0 V)
+    Pulsador S1:   GPIO27 a GND (pull-up interno, C6 100n en paralelo). Cambia óptico <-> ultrasonido
+    LCD I2C:       GND->GND, VCC->5 V, SDA->GPIO21, SCL->GPIO22. Contraste con el trimmer azul del módulo.
+
+  Geometría: d = distancia medida, h = H_SENSOR - d = altura del producto.
+  Como el envase se abre hacia arriba, el radio a la altura h es r(h) = R_BASE + (R_BOCA - R_BASE)·h/H_TANQUE
+  y el volumen es el de un cono truncado:  V(h) = π·h·(R_BASE² + R_BASE·r(h) + r(h)²)/3
+  Medida de Majo: cara de los sensores -> fondo = 37.5 cm, o sea 9.8 cm sobre la boca (el Sharp pide 10 cm:
+  justo en el límite; con el envase lleno el canal óptico puede marcar "SAT" en el último 0.5 cm).
+  1 cm de altura ≈ 80–95 cm³, así que el 0.5 cm³ es solo la resolución de presentación.
+
+  El volumen se muestra redondeado a 0.5 cm³ (resolución de presentación que pide la guía).
+
+  Monitor serie (115200). Sale una línea CSV por ciclo con los DOS sensores:
+      t_ms,producto,mV_opt,h_opt_cm,V_opt_cm3,t_us,h_us_cm,V_us_cm3
+  Comandos (escribir la letra y Enter):
+      a = arroz   f = fríjol   o = mostrar óptico   u = mostrar ultrasonido   t = imprimir tabla óptica
+*/
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>   // librería "LiquidCrystal I2C" (Frank de Brabander)
+#include <math.h>
+
+// ==================== AJUSTES DE SU MONTAJE ====================
+const float H_SENSOR = 37.5;   // cm, cara de los sensores -> fondo. 37.5 medido; 40 si los suben
+const float V_5V     = 4.8;    // V reales del riel de 5 V (medir con multímetro entre VIN y GND)
+float TEMP_C         = 20.0;   // °C del laboratorio (la velocidad del sonido cambia 0.17 %/°C)
+#define LCD_ADDR 0x27          // si no muestra nada prueben 0x3F
+// ===============================================================
+
+// ---------- Pines ----------
+#define PIN_OPT    34   // ADC1_CH6 (solo entrada)
+#define PIN_TRIG   25
+#define PIN_ECHO   35   // solo entrada, viene del divisor 2.2k/3.3k
+#define PIN_BOTON  27
+#define PIN_SDA    21
+#define PIN_SCL    22
+
+// La dirección del módulo (0x27 o 0x3F) se busca sola al arrancar; LCD_ADDR solo se usa si no aparece
+LiquidCrystal_I2C *lcdp;
+#define lcd (*lcdp)
+
+uint8_t buscarLcd() {
+  for (uint8_t a = 0x20; a <= 0x3F; a++) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0) return a;
+  }
+  return 0;
+}
+
+// ---------- Tanque ----------
+const float H_TANQUE = 27.7;                  // cm, altura del envase
+const float R_BASE   = 4.0;                   // cm, radio INTERNO del fondo (Ø 8 cm)
+const float R_BOCA   = 5.35;                  // cm, radio INTERNO de la boca (Ø 10.7 cm)
+float V_MAX;                                  // se calcula en setup(): ≈ 1915 cm³
+
+// Volumen de producto (cm³) para una altura h (cm), sin redondear
+float volumenCono(float h) {
+  if (h < 0) h = 0;
+  if (h > H_TANQUE) h = H_TANQUE;
+  float r = R_BASE + (R_BOCA - R_BASE) * h / H_TANQUE;
+  return M_PI * h * (R_BASE * R_BASE + R_BASE * r + r * r) / 3.0f;
+}
+
+// ---------- Canal óptico ----------
+// Acondicionamiento: Vout = G·Vs - VOFF, con G = 1 + Rf/Rth = 1 + 6.8k/10.31k = 1.659
+// y VOFF = (Rf/Rth)·Vth = 0.659·V_5V·15/48  (1.030 V con 5.0 V; 0.988 V con 4.8 V)
+const float G_OPT  = 1.659;
+const float VOFF   = 0.659 * V_5V * 15.0 / 48.0;
+const float MV_SAT = 3100;     // por encima de esto el ADC (11 dB) ya no es confiable
+
+// Tabla de calibración mV (GPIO34) contra altura de producto h (cm), una por producto.
+// Al arrancar se llena con el modelo TEÓRICO del Sharp (d = 27.86·Vs^-1.15) y el H_SENSOR de arriba.
+// Con USAR_TABLA_MEDIDA = true se usa la tabla que midió Majo con regla y multímetro (2026-10-28,
+// Ra 47k / Rb 12k). Por debajo de 10.5 cm el Sharp no da una señal útil en este envase (el voltaje
+// no es creciente), así que el canal óptico mide de 10.5 a ~26.5 cm: ese es su LRL/URL real.
+const int N_CAL = 13;
+float calH[N_CAL];          // alturas de la tabla (se llenan en armarTablas)
+const bool USAR_TABLA_MEDIDA = true;
+const int N_MED = 5;
+float medH[N_MED] = { 10.5, 15.5, 18.3, 25.0, 26.3 };     // cm, altura real con regla
+float calMedida[2][N_MED] = {                             // mV en GPIO34
+  { 300, 1220, 1538, 2479, 2920 },                        // arroz
+  { 300, 1220, 1538, 2479, 2920 }                         // fríjol (por ahora igual; cámbienlo al calibrar)
+};
+float calMv[2][N_CAL];
+int   nCal[2];              // puntos útiles (sin saturar) de cada tabla
+int   PRODUCTO = 0;         // 0 arroz, 1 fríjol (se cambia con 'a' / 'f' por el monitor serie)
+const char *NOMBRE[2] = { "arroz", "frijol" };
+
+const int VENTANA_US = 80000;  // promedia 80 ms ≈ 2 ciclos de medición del Sharp (38 ms c/u)
+
+// ---------- Canal ultrasonido ----------
+const int N_ECO = 9;           // ecos por medición (se usa la mediana)
+// Corrección lineal que sale de la calibración: h_real = US_GANANCIA·h_medida + US_OFFSET
+float US_GANANCIA = 1.0;
+float US_OFFSET   = 0.0;
+
+// ---------- Estado ----------
+volatile bool modoOptico = true;
+volatile bool cambioModo = false;
+volatile unsigned long tUltimaPulsacion = 0;
+
+byte superTres[8] = { 0b11100, 0b00100, 0b11100, 0b00100, 0b11100, 0, 0, 0 };  // "³"
+
+// mV teóricos en GPIO34 para una altura de producto h
+float mvTeorico(float h) {
+  float d  = H_SENSOR - h;
+  float vs = powf(27.86f / d, 1.0f / 1.15f);     // salida típica del GP2Y0A21YK0F
+  float vo = G_OPT * vs - VOFF;
+  return 1000.0f * vo;
+}
+
+// Llena las tablas y cuenta los puntos que no saturan (deben quedar crecientes)
+void armarTablas() {
+  if (USAR_TABLA_MEDIDA) {
+    for (int i = 0; i < N_MED; i++) calH[i] = medH[i];
+    for (int p = 0; p < 2; p++) {
+      for (int i = 0; i < N_MED; i++) calMv[p][i] = calMedida[p][i];
+      nCal[p] = N_MED;
+    }
+    return;
+  }
+  for (int i = 0; i < N_CAL; i++) calH[i] = H_TANQUE * i / (N_CAL - 1);
+  for (int p = 0; p < 2; p++) {
+    nCal[p] = 0;
+    for (int i = 0; i < N_CAL; i++) {
+      float mv = mvTeorico(calH[i]);
+      if (mv >= MV_SAT) break;
+      if (nCal[p] > 0 && mv <= calMv[p][nCal[p] - 1]) break;   // la tabla debe ser creciente
+      calMv[p][nCal[p]++] = mv;
+    }
+  }
+}
+
+void imprimirTabla() {
+  Serial.printf("# Tabla optica (%s), H_SENSOR=%.1f cm, V_5V=%.2f V, VOFF=%.3f V\n",
+                NOMBRE[PRODUCTO], H_SENSOR, V_5V, VOFF);
+  for (int i = 0; i < nCal[PRODUCTO]; i++)
+    Serial.printf("#  h=%5.1f cm  V=%6.1f cm3  d=%5.1f cm  ->  %6.0f mV\n",
+                  calH[i], volumenCono(calH[i]), H_SENSOR - calH[i], calMv[PRODUCTO][i]);
+  if (!USAR_TABLA_MEDIDA && nCal[PRODUCTO] < N_CAL)
+    Serial.printf("#  desde h=%.1f cm el canal optico satura (sensor muy cerca)\n", calH[nCal[PRODUCTO]]);
+}
+
+// Interpolación lineal en una tabla ordenada de menor a mayor x
+float interpolar(float x, const float *xs, const float *ys, int n) {
+  if (x <= xs[0]) return ys[0];
+  if (x >= xs[n - 1]) return ys[n - 1];
+  for (int i = 1; i < n; i++) {
+    if (x <= xs[i]) {
+      float f = (x - xs[i - 1]) / (xs[i] - xs[i - 1]);
+      return ys[i - 1] + f * (ys[i] - ys[i - 1]);
+    }
+  }
+  return ys[n - 1];
+}
+
+// Promedio de la salida del canal óptico durante VENTANA_US (en mV)
+float leerOpticoMv() {
+  uint32_t suma = 0, n = 0;
+  unsigned long t0 = micros();
+  while (micros() - t0 < (unsigned long)VENTANA_US) {
+    suma += analogReadMilliVolts(PIN_OPT);   // usa la calibración de fábrica (eFuse) del ADC
+    n++;
+  }
+  return (float)suma / n;
+}
+
+// Tiempo de vuelo (µs) de un eco; 0 si no hubo eco
+unsigned long unEco() {
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(4);
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+  return pulseIn(PIN_ECHO, HIGH, 30000);      // espera hasta 30 ms (algunos clones tardan en subir Echo)
+}
+
+// Mediana de N_ECO ecos válidos (quita ecos falsos de las paredes o de un grano suelto)
+float leerUltrasonidoUs() {
+  unsigned long t[N_ECO];
+  int n = 0;
+  for (int i = 0; i < N_ECO * 2 && n < N_ECO; i++) {
+    unsigned long x = unEco();
+    if (x > 100 && x < 6000) t[n++] = x;     // válido: 2 cm a 1 m
+    delay(30);                                // deja morir los rebotes dentro del tubo
+  }
+  if (n == 0) return NAN;
+  for (int i = 1; i < n; i++) {               // ordenamiento por inserción
+    unsigned long k = t[i]; int j = i - 1;
+    while (j >= 0 && t[j] > k) { t[j + 1] = t[j]; j--; }
+    t[j + 1] = k;
+  }
+  return (n % 2) ? t[n / 2] : 0.5 * (t[n / 2 - 1] + t[n / 2]);
+}
+
+float volumenDeAltura(float h) {
+  float v = volumenCono(h);
+  return roundf(v * 2.0f) / 2.0f;             // resolución de presentación: 0.5 cm³
+}
+
+// Interrupción del pulsador: así no se pierde una pulsación mientras se mide (cada ciclo dura ~0.4 s)
+void IRAM_ATTR isrBoton() {
+  unsigned long ahora = millis();
+  if (ahora - tUltimaPulsacion > 250) {       // antirrebote por software (además de C6)
+    modoOptico = !modoOptico;
+    cambioModo = true;
+  }
+  tUltimaPulsacion = ahora;
+}
+
+// estado: 0 = válido, 1 = sin lectura, 2 = saturado (sensor demasiado cerca)
+void mostrar(const char *tec, float h, float v, int estado) {
+  char l1[17], l2[17];
+  char p = (PRODUCTO == 0) ? 'A' : 'F';
+  if (estado == 1) {
+    snprintf(l1, sizeof(l1), "%-3s%c sin lectura", tec, p);
+    snprintf(l2, sizeof(l2), "revise sensor   ");
+  } else if (estado == 3) {
+    snprintf(l1, sizeof(l1), "%-3s%c h<%4.1fcm  ", tec, p, h);
+    snprintf(l2, sizeof(l2), "fuera de rango  ");
+  } else if (estado == 2) {
+    snprintf(l1, sizeof(l1), "%-3s%c SAT >%4.1fcm", tec, p, h);
+    snprintf(l2, sizeof(l2), "V >%6.1f cm", v);
+  } else {
+    snprintf(l1, sizeof(l1), "%-3s%c h=%6.2fcm", tec, p, h);
+    snprintf(l2, sizeof(l2), "V = %6.1f cm", v);
+  }
+  lcd.setCursor(0, 0); lcd.print(l1);
+  lcd.setCursor(0, 1); lcd.print(l2);
+  if (estado == 0 || estado == 2) { lcd.write(byte(0)); lcd.print("  "); }
+}
+
+void leerComandos() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'a' || c == 'A') { PRODUCTO = 0; Serial.println("# producto: arroz"); }
+    if (c == 'f' || c == 'F') { PRODUCTO = 1; Serial.println("# producto: frijol"); }
+    if (c == 'o' || c == 'O') { modoOptico = true;  cambioModo = true; }
+    if (c == 'u' || c == 'U') { modoOptico = false; cambioModo = true; }
+    if (c == 't' || c == 'T') imprimirTabla();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("# Medidor de volumen - arrancando");
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+  pinMode(PIN_BOTON, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_BOTON), isrBoton, FALLING);
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_OPT, ADC_11db);  // rango ~0.15–3.1 V
+
+  armarTablas();
+
+  Wire.begin(PIN_SDA, PIN_SCL);
+  uint8_t dir = buscarLcd();
+  if (dir) Serial.printf("# LCD encontrada en 0x%02X\n", dir);
+  else {
+    Serial.println("# NO se encontro la LCD por I2C: revise SDA->21, SCL->22, VCC->5V, GND comun");
+    dir = LCD_ADDR;
+  }
+  lcdp = new LiquidCrystal_I2C(dir, 16, 2);
+  lcd.init();
+  lcd.backlight();
+  lcd.createChar(0, superTres);
+  lcd.print("Volumen tanque");
+  lcd.setCursor(0, 1);
+  lcd.print("Opt/US: boton");
+  delay(1500);
+  lcd.clear();
+
+  imprimirTabla();
+  Serial.println("t_ms,producto,mV_opt,h_opt_cm,V_opt_cm3,t_us,h_us_cm,V_us_cm3");
+}
+
+void loop() {
+  leerComandos();
+
+  // Se miden los dos canales siempre (sirve para comparar); el botón solo elige cuál se muestra
+  float mv   = leerOpticoMv();
+  int   n    = nCal[PRODUCTO];
+  float hOpt = interpolar(mv, calMv[PRODUCTO], calH, n);
+  float vOpt = volumenDeAltura(hOpt);
+  int   eOpt = (mv < 100) ? 1 : (mv >= MV_SAT || mv > calMv[PRODUCTO][n - 1] + 50) ? 2
+             : (mv < calMv[PRODUCTO][0] - 50) ? 3 : 0;
+
+  float tUs  = leerUltrasonidoUs();
+  float c    = (331.3 + 0.606 * TEMP_C) * 1e-4;            // cm/µs
+  float hUs  = NAN, vUs = NAN;
+  if (!isnan(tUs)) {
+    float d = tUs * c / 2.0;
+    hUs = US_GANANCIA * (H_SENSOR - d) + US_OFFSET;
+    vUs = volumenDeAltura(hUs);
+  }
+
+  if (cambioModo) { cambioModo = false; lcd.clear(); }
+  if (modoOptico) mostrar("OPT", hOpt, vOpt, eOpt);
+  else            mostrar("US",  hUs,  vUs,  isnan(tUs) ? 1 : 0);
+
+  Serial.printf("%lu,%s,%.1f,%.3f,%.1f,%.0f,%.3f,%.1f\n",
+                millis(), NOMBRE[PRODUCTO], mv, hOpt, vOpt, tUs, hUs, vUs);
+}
