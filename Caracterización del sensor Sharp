@@ -1,0 +1,89 @@
+%% Práctica 7 - Caracterización del sensor Sharp GP2Y0A21YK0F (canal óptico)
+% Curvas teórica, simulada (Proteus) y medida del voltaje acondicionado en GPIO34
+% contra la altura de arroz en el envase.
+% Montaje: cara del sensor a Hs = 37.5 cm del fondo. Envase: cono truncado de 27.7 cm,
+% Ø interno 8 cm en el fondo y 10.7 cm en la boca.
+% Acondicionamiento: Vout = G*Vs - Voff, con Rf = 6.8k, Ra = 47k (a 5 V), Rb = 12k (a GND).
+% Genera: caracterizacion_sharp.png y volumen_altura.png (para el informe).
+clear; clc; close all;
+
+%% Datos medidos (regla + multímetro en GPIO34)
+h_med = [0 6.33 10.5 15.5 18.3 25 26.3];              % altura de arroz (cm)
+V_med = [0.522 0.044 0.300 1.220 1.538 2.479 2.920];   % voltaje en GPIO34 (V)
+
+%% Datos simulados en Proteus (COMPLETAR con los valores de su simulación)
+% En Proteus el Sharp se reemplaza por una fuente DC con el Vs teórico de cada altura
+% (columna Vs que imprime este script). Escriban aquí el voltaje que dio Proteus en GPIO34.
+V_sim = nan(size(h_med));
+
+%% Parámetros del montaje y del circuito
+Hs  = 37.5;                  % cm, cara del sensor -> fondo
+H   = 27.7;                  % cm, altura del envase
+R0  = 4.0;  R1 = 5.35;       % cm, radios internos del fondo y de la boca
+V5  = 4.8;                   % V, riel de 5 V (VIN del ESP32 por USB)
+Rf  = 6.8e3;  Ra = 47e3;  Rb = 12e3;
+Rth  = Ra*Rb/(Ra+Rb);        % resistencia Thevenin del divisor
+Vth  = V5*Rb/(Ra+Rb);        % voltaje Thevenin del divisor
+G    = 1 + Rf/Rth;           % ganancia de la etapa no inversora
+Voff = (Rf/Rth)*Vth;         % offset que se resta
+fprintf('G = %.3f   Voff = %.3f V\n', G, Voff);
+
+%% Volumen del cono truncado
+r  = @(h) R0 + (R1-R0).*h./H;                          % radio a la altura h
+Vol = @(h) pi.*h.*(R0^2 + R0.*r(h) + r(h).^2)./3;       % cm^3
+fprintf('Volumen máximo = %.1f cm^3\n', Vol(H));
+
+%% Curva teórica (modelo típico de la hoja de datos: d = 27.86*Vs^-1.15)
+h_t  = linspace(0, H, 300);
+d_t  = Hs - h_t;
+Vs_t = (27.86./d_t).^(1/1.15);
+Vo_t = G*Vs_t - Voff;
+
+% Vs teórico en cada altura medida (para la fuente DC de Proteus)
+Vs_med_t = (27.86./(Hs - h_med)).^(1/1.15);
+Vo_med_t = G*Vs_med_t - Voff;
+fprintf('\n  h (cm)   d (cm)   Vs teo (V)   Vout teo (V)   Vout med (V)\n');
+fprintf('  %6.2f   %6.2f   %8.3f     %8.3f       %8.3f\n', ...
+        [h_med; Hs-h_med; Vs_med_t; Vo_med_t; V_med]);
+
+%% Ajuste lineal en la zona útil (h >= 10.5 cm)
+util = h_med >= 10.5;
+p  = polyfit(h_med(util), V_med(util), 1);
+Vf = polyval(p, h_med(util));
+R2 = 1 - sum((V_med(util)-Vf).^2)/sum((V_med(util)-mean(V_med(util))).^2);
+pv = polyfit(Vol(h_med(util)), V_med(util), 1);
+e_lin = max(abs(V_med(util) - Vf));
+fprintf('\nAjuste zona útil: Vout = %.4f*h %+.4f  (R^2 = %.4f)\n', p(1), p(2), R2);
+fprintf('Sensibilidad: %.1f mV/cm  =  %.3f mV/cm^3\n', 1000*p(1), 1000*pv(1));
+fprintf('Error máx. de linealidad: %.3f V = %.2f cm\n', e_lin, e_lin/p(1));
+fprintf('LRV = %.1f cm^3 (h = 10.5 cm), URV = %.1f cm^3 (h = 26.3 cm), span = %.1f cm^3\n', ...
+        Vol(10.5), Vol(26.3), Vol(26.3)-Vol(10.5));
+
+%% Figura 1: caracterización
+figure('Name','Caracterización Sharp','Color','w','Position',[100 100 640 440]);
+hold on; grid on; box on;
+fill([0 10.5 10.5 0], [-0.4 -0.4 3.5 3.5], [0.92 0.92 0.92], 'EdgeColor','none', ...
+     'DisplayName','Zona no útil (h < 10.5 cm)');
+plot(h_t, Vo_t, 'b-', 'LineWidth', 1.6, 'DisplayName', 'Teórico (hoja de datos)');
+if any(~isnan(V_sim))
+    plot(h_med, V_sim, 'gs--', 'LineWidth', 1.2, 'MarkerFaceColor','g', 'DisplayName', 'Simulado (Proteus)');
+end
+plot(h_med, V_med, 'ro-', 'LineWidth', 1.6, 'MarkerFaceColor','r', 'DisplayName', 'Medido');
+hf = linspace(10.5, 26.3, 50);
+plot(hf, polyval(p, hf), 'k--', 'LineWidth', 1.1, ...
+     'DisplayName', sprintf('Ajuste: %.3fh %+.3f (R^2=%.3f)', p(1), p(2), R2));
+yline(3.3, ':', '3.3 V (límite ADC)', 'Color', [0.4 0.4 0.4], 'HandleVisibility','off');
+xlabel('Altura de arroz h (cm)'); ylabel('Voltaje en GPIO34 (V)');
+title('Caracterización del canal óptico (Sharp GP2Y0A21YK0F)');
+xlim([0 H]); ylim([-0.4 3.5]);
+legend('Location','northwest');
+exportgraphics(gcf, 'caracterizacion_sharp.png', 'Resolution', 300);
+
+%% Figura 2: volumen contra altura del envase
+figure('Name','Volumen del envase','Color','w','Position',[150 150 640 400]);
+plot(h_t, Vol(h_t), 'b-', 'LineWidth', 1.6); grid on; hold on;
+plot(h_t, pi*R0^2*h_t, 'k:', 'LineWidth', 1.1);
+xlabel('Altura de producto h (cm)'); ylabel('Volumen (cm^3)');
+title('Volumen del cono truncado (Ø 8 cm fondo, Ø 10.7 cm boca)');
+legend('Cono truncado', 'Cilindro de Ø 8 cm (referencia)', 'Location','northwest');
+exportgraphics(gcf, 'volumen_altura.png', 'Resolution', 300);
